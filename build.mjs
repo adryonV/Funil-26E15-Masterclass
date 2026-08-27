@@ -239,7 +239,10 @@ async function main(){
   const ads = canon.ads;
   const { sales, counts, skippedStatus, mergedBumps, excludedNonCore } = parseSales(salesCsv, canon);
 
-  const days = ads.map(r => r.d).sort();
+  // Intervalo cobre anúncios E vendas: há dias com venda mas sem gasto lançado
+  // ainda (o Meta demora a publicar a linha de hoje). Se olhasse só os anúncios,
+  // "Hoje"/"Tudo" travariam no último dia com gasto e esconderiam as vendas de hoje.
+  const days = [...ads.map(r => r.d), ...sales.map(s => s.d)].sort();
   const date_min = days[0] || DATE_FALLBACK;
   const date_max = days[days.length-1] || DATE_FALLBACK;
 
