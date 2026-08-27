@@ -94,6 +94,16 @@ const normKey = s => fold(s);
 const PAID_SRC = new Set(["facebook-ads", "meta"]);
 const isPaidSrc = s => PAID_SRC.has(fold(s));
 
+// Nomes do Meta são segmentados por "|" (ex.: "26-E15 | BTS | E4-VEN | ... | Top ads",
+// anúncio "BTS | VD_216"). O cliente às vezes INSERE/REMOVE um segmento (ex.: "BTS |")
+// DEPOIS que a venda já gravou a UTM antiga → o casamento exato quebra. Estes helpers
+// deixam a atribuição tolerante: cauda do anúncio (último segmento = código criativo)
+// e casamento de campanha por SUBSEQUÊNCIA de segmentos (tolera token inserido no meio).
+const lastSeg = s => { const p = String(s||"").split("|"); return fold(p[p.length-1]); };
+const segsOf  = s => String(s||"").split("|").map(x => fold(x)).filter(Boolean);
+// short é subsequência de long? (todos os segmentos de short aparecem em long, na ordem)
+const isSubseq = (short, long) => { let i = 0; for (const t of long){ if (i < short.length && short[i] === t) i++; } return i === short.length; };
+
 // ----------------------------------------------------------------- ADS
 function parseAds(csv){
   const rows = parseCsv(csv);
@@ -109,12 +119,19 @@ function parseAds(csv){
   const iIc  = at("Checkouts Initiated","Checkout Initiated","Finalizações de compra iniciadas","Checkouts");
   const ads = [];
   const canonCamp = new Map(), canonSet = new Map(), canonAd = new Map();
+  const adAlias   = new Map();   // cauda do anúncio (ex.: "vd_216") -> {name, spend}
+  const comboSetAd= new Map();   // "<conjunto>¦<cauda-anúncio>" -> {c,s,a,spend}
+  const comboAd   = new Map();   // "<cauda-anúncio>"            -> {c,s,a,spend}
+  const campBySet = new Map();   // "<conjunto>"                 -> {c,spend}
+  const campList  = new Map();   // "<campanha normalizada>"     -> {segs,name,spend}
+  const bump = (map, key, cand) => { const cur = map.get(key); if (!cur || cand.spend > cur.spend) map.set(key, cand); };
   for (const r of rows.slice(1)){
     const d = isoDate(r[iDay]); if (!d) continue;
     const c = (r[iC]||"").trim(), s = (r[iS]||"").trim(), a = (r[iA]||"").trim();
+    const spend = num(r[iSpend]);
     ads.push({
       d, c, s, a,
-      spend: num(r[iSpend]),      // BRUTO — imposto aplicado no dashboard
+      spend,                      // BRUTO — imposto aplicado no dashboard
       imp: Math.round(num(r[iImp])),
       clk: Math.round(num(r[iClk])),
       lpv: iLpv >= 0 ? Math.round(num(r[iLpv])) : 0,
@@ -123,8 +140,17 @@ function parseAds(csv){
     if (c) canonCamp.set(normKey(c), c);
     if (s) canonSet.set(normKey(s), s);
     if (a) canonAd.set(normKey(a), a);
+    // índices tolerantes a renomeação (cauda do anúncio + combos vindos da planilha)
+    const tk = lastSeg(a), setKey = normKey(s);
+    if (a && tk){
+      bump(adAlias, tk, { name: a, spend });
+      bump(comboSetAd, setKey + "¦" + tk, { c, s, a, spend });
+      bump(comboAd, tk, { c, s, a, spend });
+    }
+    if (s && c) bump(campBySet, setKey, { c, spend });
+    if (c) bump(campList, normKey(c), { segs: segsOf(c), name: c, spend });
   }
-  return { ads, canonCamp, canonSet, canonAd };
+  return { ads, canonCamp, canonSet, canonAd, adAlias, comboSetAd, comboAd, campBySet, campList };
 }
 
 // ----------------------------------------------------------------- SALES
@@ -144,12 +170,21 @@ function parseSales(csv, canon){
   const iPed  = at("Pedido","Order","Order Id","Order ID","Transação","Transacao");
   const iProd = at("Produto","Product","Oferta/Produto","Item","Oferta");
 
-  const { canonCamp, canonSet, canonAd } = canon;
+  const { canonCamp, canonSet, canonAd, adAlias, comboSetAd, comboAd, campBySet, campList } = canon;
   // Fallback por SCK/src bruto: acha nome conhecido por substring (longest-first).
   const knownAds = [...canonAd.values()].sort((a,b)=>b.length-a.length);
   const knownSets= [...canonSet.values()].sort((a,b)=>b.length-a.length);
   const knownCamp= [...canonCamp.values()].sort((a,b)=>b.length-a.length);
   const findIn = (blob, list) => { const f = fold(blob); for (const name of list){ if (f.includes(fold(name))) return name; } return ""; };
+  const campVals = [...campList.values()];
+  // Campanha por subsequência de segmentos (tolera "BTS |" inserido no meio).
+  // Match onde a UTM é subsequência do nome da planilha (ou vice-versa); desempata por gasto.
+  const campBySubseq = uCamp => {
+    const su = segsOf(uCamp); if (!su.length) return "";
+    let best = null;
+    for (const e of campVals){ if (isSubseq(su, e.segs) || isSubseq(e.segs, su)){ if (!best || e.spend > best.spend) best = e; } }
+    return best ? best.name : "";
+  };
 
   // Resolve origem + atribuição de UMA linha. Todas as linhas de um pedido
   // (produto principal + order bumps) compartilham a mesma UTM, então qualquer
@@ -161,10 +196,21 @@ function parseSales(csv, canon){
       const uCamp = iCamp >= 0 ? (r[iCamp]||"").trim() : "";
       const uMed  = iMed  >= 0 ? (r[iMed]||"").trim()  : "";
       const uCont = iCont >= 0 ? (r[iCont]||"").trim() : "";
+      // 1) casamento direto por nome
       c = canonCamp.get(normKey(uCamp)) || "";
       s = canonSet.get(normKey(uMed))   || "";
       a = canonAd.get(normKey(uCont))   || "";
-      if (!a || !c){   // fallback: varre sck/src bruto por nomes conhecidos
+      // 2) tolerante a renomeação: anúncio pela cauda (código criativo); campanha por subsequência
+      if (!a){ const al = adAlias.get(lastSeg(uCont)); if (al) a = al.name; }
+      if (!c) c = campBySubseq(uCamp);
+      // 3) deriva o que faltar do combo conjunto+criativo da própria planilha de anúncios
+      if (!a || !c || !s){
+        const combo = comboSetAd.get(normKey(uMed) + "¦" + lastSeg(uCont)) || comboAd.get(lastSeg(uCont));
+        if (combo){ if (!a) a = combo.a; if (!s) s = combo.s; if (!c) c = combo.c; }
+      }
+      if (!c && s){ const cb = campBySet.get(normKey(uMed)); if (cb) c = cb.c; }
+      // 4) último recurso: varre sck/src bruto por nomes conhecidos
+      if (!a || !c){
         const blob = [(iSck>=0?r[iSck]:""), (iSrcB>=0?r[iSrcB]:"")].join(" | ");
         if (!a) a = findIn(blob, knownAds);
         if (!s) s = findIn(blob, knownSets);
