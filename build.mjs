@@ -178,11 +178,18 @@ function parseSales(csv, canon){
   const findIn = (blob, list) => { const f = fold(blob); for (const name of list){ if (f.includes(fold(name))) return name; } return ""; };
   const campVals = [...campList.values()];
   // Campanha por subsequência de segmentos (tolera "BTS |" inserido no meio).
-  // Match onde a UTM é subsequência do nome da planilha (ou vice-versa); desempata por gasto.
+  // A UTM da venda (nome antigo) pode ser subsequência de VÁRIAS campanhas: a certa
+  // (só ganhou "BTS |") e outras que têm um segmento REAL a mais (ex.: "LAL Alunos").
+  // Preferimos o match MAIS JUSTO (menor diferença de nº de segmentos); só desempata
+  // por gasto. Isso evita jogar a venda de "Top ads" na "LAL Alunos | Top ads".
   const campBySubseq = uCamp => {
     const su = segsOf(uCamp); if (!su.length) return "";
-    let best = null;
-    for (const e of campVals){ if (isSubseq(su, e.segs) || isSubseq(e.segs, su)){ if (!best || e.spend > best.spend) best = e; } }
+    let best = null, bestDist = Infinity;
+    for (const e of campVals){
+      if (!(isSubseq(su, e.segs) || isSubseq(e.segs, su))) continue;
+      const dist = Math.abs(e.segs.length - su.length);
+      if (dist < bestDist || (dist === bestDist && best && e.spend > best.spend)){ best = e; bestDist = dist; }
+    }
     return best ? best.name : "";
   };
 
