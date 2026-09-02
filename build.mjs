@@ -90,8 +90,8 @@ function isoDate(v){
 }
 
 const normKey = s => fold(s);
-// Conta como tráfego pago quem tem utm_source "facebook-ads" OU "meta" (regra do cliente).
-const PAID_SRC = new Set(["facebook-ads", "meta"]);
+// Conta como tráfego pago quem tem utm_source "facebook-ads", "meta" OU "meta-ads" (regra do cliente).
+const PAID_SRC = new Set(["facebook-ads", "meta", "meta-ads"]);
 const isPaidSrc = s => PAID_SRC.has(fold(s));
 
 // Nomes do Meta são segmentados por "|" (ex.: "26-E15 | BTS | E4-VEN | ... | Top ads",
